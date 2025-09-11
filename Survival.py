@@ -1,4 +1,4 @@
-#Imports
+#Imports and package installations
 !pip install lifelines
 !pip install scikit-survival openpyxl --quiet
 
@@ -6,8 +6,11 @@ from sklearn.model_selection import train_test_split
 from sksurv.ensemble import RandomSurvivalForest
 from sksurv.util import Surv
 from sksurv.metrics import concordance_index_censored
-from lifelines import WeibullAFTFitter, CoxPHFitter, KaplanMeierFitter
-from scipy.stats import expon, weibull_min
+from lifelines import WeibullAFTFitter, CoxPHFitter, KaplanMeierFitter, LogLogisticFitter
+from scipy import optimize
+from scipy.optimize import minimize
+from scipy.stats import expon, weibull_min, norm
+from scipy.special import gamma, gammainc
 from lifelines.statistics import proportional_hazard_test, logrank_test, multivariate_logrank_test
 from lifelines.utils import concordance_index
 from IPython.display import display
@@ -16,435 +19,226 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 
-#Non-informative Censoring Test
+#Data processing
 
-#Loading and preparing the data
-filename = '/content/pone.0148733.s001.xlsx'
-df = pd.read_excel(filename, sheet_name='data')
+#Initializing the data
+df = pd.read_excel("pone.0148733.s001.xlsx", sheet_name="data")
 
-columns_to_use = ['OS', 'status', 'Sex', 'Diagnosis', 'Location', 'KI', 'GTV', 'Stereotactic methods']
-df_clean = df[columns_to_use].dropna().copy()
-df_clean.rename(columns={'OS': 'duration', 'status': 'event'}, inplace=True)
+#Cleaning the data
+df = df.dropna()
 
-#Fitting Weibull model to data
-aft = WeibullAFTFitter()
-aft.fit(df_clean, duration_col='duration', event_col='event')
+#Constants and defining covariate array
+event_col = "status"
+duration_col = "OS"
+covariates = ["Sex", "Diagnosis", "Location", "KI", "GTV", "Stereotactic methods"]
 
-#Function imputes additional or less survival time for censored subjects
-def impute_and_fit(df, gamma, n_imputations=10):
-    stats = []
-    rho = np.exp(aft.params_['rho_'])
-    for _ in range(n_imputations):
-        df_imp = df.copy()
-        pred_median = aft.predict_median(df_imp)
-        for idx, row in df_imp[df_imp['event'] == 0].iterrows():
-            lam = 1 / pred_median.loc[idx]
-            lam_adj = lam * gamma
-            t0 = row['duration']
-            add_time = weibull_min(c=rho, scale=1/lam_adj).rvs()
-            df_imp.at[idx, 'duration'] = t0 + add_time
-            df_imp.at[idx, 'event'] = 1
-        cph = CoxPHFitter()
-        cph.fit(df_imp, duration_col='duration', event_col='event')
-        #Note: below line can be modified for other covariates in the data
-        stats.append(cph.hazard_ratios_['KI'])
-    return np.mean(stats), np.std(stats)
+#Fitting cox model
 
-#Sets sensitivity parameters
-gammas = np.linspace(0.5, 2.0, 7)
-means, stds = [], []
-
-#Runs above function imputing survival times and records mean and standard deviation of the hazard ratio for Karnofsky Index (for each sensitivity value)
-for gamma in gammas:
-    mean_hr, std_hr = impute_and_fit(df_clean, gamma, n_imputations=20)
-    means.append(mean_hr)
-    stds.append(std_hr)
-    print(f"gamma={gamma:.2f}: mean HR(KI)={mean_hr:.3f}, std={std_hr:.3f}")
-
-#Computes and records the range and standard deviation of the mean hazard ratios from each imputed trial
-hr_range = max(means) - min(means)
-hr_std = np.std(means)
-print(f"\nRange of mean HR(KI) across gamma: {hr_range:.3f}")
-print(f"Std of mean HR(KI) across gamma: {hr_std:.3f}")
-
-#Plot results (mean hazard ratio versus gamma)
-plt.errorbar(gammas, means, yerr=stds, fmt='o-', capsize=5)
-plt.xlabel('Sensitivity Parameter')
-plt.ylabel('Mean Hazard Ratio for KI')
-plt.title('Sensitivity of HR')
-plt.show()
-
-#Shoenfeld Test for Proportional Hazards
-
-#Data loading and standardizing for lifelines module
-filename = '/content/pone.0148733.s001.xlsx'
-df = pd.read_excel(filename, sheet_name='data')
-
-covariates = ['Sex', 'Diagnosis', 'Location', 'KI', 'GTV', 'Stereotactic methods']
-df_clean = df[['OS', 'status'] + covariates].dropna().copy()
-df_clean.rename(columns={'OS': 'duration', 'status': 'event'}, inplace=True)
-
-#Fitting Cox model on data
+#Fitting and outputting cox model
 cph = CoxPHFitter()
-cph.fit(df_clean, duration_col='duration', event_col='event')
+cph.fit(df[[duration_col, event_col] + covariates], duration_col=duration_col, event_col=event_col)
 
-#Schoenfeld residual test with log(t_i)
-schoenfeld_test = proportional_hazard_test(cph, df_clean, time_transform='log')
+print("\nCox Model Summary (beta coefficients):")
+print(cph.summary)
 
-#Performing test for each covariate
-results = schoenfeld_test.summary.loc[covariates].copy()
-results = results.reset_index()
+#Baseline survival
+baseline_surv = cph.baseline_survival_
+print("\nBaseline Survival Function:")
 
-#Formatting and table preparation
-def format_float(x):
-    s = f"{x:.4f}"
-    return s.rstrip('0').rstrip('.') if '.' in s else s
+#First and last 6 points (for paper)
+print(baseline_surv.head(6))
+print(cph.baseline_survival_.tail(6))
 
-results['Covariate'] = results['index']
-results['Test_statistic'] = results['test_statistic'].apply(format_float)
-results['P-value'] = results['p'].apply(format_float)
-results['-log₂(P)'] = (-np.log2(results['p'])).apply(format_float)
+#AIC for cox model
+cox_aic = cph.AIC_partial_
+print(f"AIC (Cox PH model): {cox_aic:.3f}")
 
-table = results[['Covariate', 'Test_statistic', 'P-value', '-log₂(P)']]
+#C-index for cox model
+cox_cindex = concordance_index(df["OS"], -cph.predict_partial_hazard(df), df["status"])
+print(f"C-index (Cox PH model): {cox_cindex:.3f}")
 
-styled_table = (
-    table.style
-    .set_table_styles(
-        [{'selector': 'th', 'props': [('text-align', 'center')]}]
-    )
-    .set_properties(**{'text-align': 'center'})
-    .hide(axis='index')
+#Performing log-likelihood
+
+#Splitting covariates by discrete v.s. continous
+continuous_covs = ['KI', 'GTV']  # continuous vars
+categorical_covs = ['Sex', 'Diagnosis', 'Location', 'Stereotactic methods']  # ID removed
+
+#Computing mean and standard deviations for the continuous covariates
+scalers = {}
+for c in continuous_covs:
+    mu, sigma = df[c].mean(), df[c].std()
+    scalers[c] = (mu, sigma)
+    df[c] = (df[c] - mu) / sigma
+covariates = categorical_covs + continuous_covs
+
+#Creating the design matrix
+T = df[duration_col].astype(float).to_numpy()
+E = df[event_col].astype(int).to_numpy()
+X = df[covariates].astype(float).to_numpy()
+X_design = np.column_stack([np.ones(len(T)), X])
+colnames = ['Intercept'] + covariates
+
+#Function defining negative log-likelihood computation
+def nll(theta):
+    beta = theta[:-1]
+    log_gamma = theta[-1]
+    gamma = np.exp(log_gamma)
+    eta = X_design @ beta
+    log_t = np.log(T + 1e-300)
+    z = np.exp(gamma * (log_t + eta))
+    logf = np.log(gamma) + (gamma - 1.0) * log_t + gamma * eta - 2.0 * np.log1p(z)
+    logS = -np.log1p(z)
+    ll = (E * logf + (1 - E) * logS).sum()
+    return -ll
+
+#Fitting under the optimizer
+p = X_design.shape[1]
+theta0 = np.zeros(p + 1)
+
+opt = minimize(nll, theta0, method='trust-constr')
+if not opt.success:
+    print("trust-constr failed, retrying with BFGS")
+    opt = minimize(nll, theta0, method='BFGS')
+
+theta_hat = opt.x
+beta_hat  = theta_hat[:-1]
+log_g_hat = theta_hat[-1]
+gamma_hat = np.exp(log_g_hat)
+
+#Computing the variance-covariance matrix
+H_inv = opt.hess_inv if hasattr(opt, 'hess_inv') else None
+vcov = np.array(H_inv) if H_inv is not None else np.full((len(theta_hat), len(theta_hat)), np.nan)
+se = np.sqrt(np.diag(vcov)) if np.all(np.isfinite(vcov)) else np.full(len(theta_hat), np.nan)
+
+#Performing Wald test
+z_vals = beta_hat / se[:-1]
+p_vals = 2 * (1 - norm.cdf(np.abs(z_vals)))
+z_logg = log_g_hat / se[-1] if np.isfinite(se[-1]) else np.nan
+p_logg = 2 * (1 - norm.cdf(np.abs(z_logg))) if np.isfinite(z_logg) else np.nan
+se_gamma = gamma_hat * se[-1] if np.isfinite(se[-1]) else np.nan
+
+# -----------------------------
+# 6) Summaries
+# -----------------------------
+coef_table = pd.DataFrame({
+    'coef (beta)': beta_hat,
+    'std err':     se[:-1],
+    'z':           z_vals,
+    'p>|z|':       p_vals
+}, index=colnames)
+
+gamma_table = pd.DataFrame({
+    'estimate (gamma)': [gamma_hat],
+    'std err (gamma)':  [se_gamma],
+    'log(gamma)':       [log_g_hat],
+    'std err log(gamma)':[se[-1]],
+    'z for log(gamma)': [z_logg],
+    'p>|z| (log gamma)':[p_logg]
+}, index=['shape'])
+
+print("\n=== Log-Logistic AFT (MLE, with standardized covariates, ID excluded) ===")
+print(coef_table.round(6))
+print("\n=== Shape parameter ===")
+print(gamma_table.round(6))
+
+#Defining estimated survival function
+def S_hat(t, x_row):
+    t = np.asarray(t, dtype=float)
+    if isinstance(x_row, dict):
+        x_vec = []
+        for c in covariates:
+            if c in continuous_covs:
+                mu, sigma = scalers[c]
+                x_vec.append((x_row.get(c, mu) - mu) / sigma)
+            else:
+                x_vec.append(x_row.get(c, 0.0))
+        x_vec = np.array(x_vec, dtype=float)
+    else:
+        x_vec = np.asarray(x_row, dtype=float)
+        assert x_vec.shape[0] == len(covariates)
+
+    eta = beta_hat[0] + np.dot(beta_hat[1:], x_vec)
+    z = (t * np.exp(eta)) ** gamma_hat
+    return 1.0 / (1.0 + z)
+
+#Log-likelihood accuracy tests
+
+#Storing value of maximized log-likelihood
+loglik = -nll(theta_hat)
+
+#Extracting and storing the of estimated parameters (betas + log gamma)
+k = len(theta_hat)
+n = len(T)
+
+#Getting both AIC and AICc (will use AIC in paper, AICc used for personal comparison)
+AIC = 2 * k - 2 * loglik
+AICc = AIC + (2 * k * (k + 1)) / (n - k - 1) if n > (k + 1) else np.nan
+
+#Computing c-index from Harrell
+eta = X_design @ beta_hat
+risk_scores = -eta  # convention: larger = riskier
+
+c_index = concordance_index(T, risk_scores, E)
+
+print(f"AIC: {AIC:.4f}")
+print(f"AICc: {AICc:.4f}")
+print(f"C-index: {c_index:.4f}")
+
+#Exponential
+
+from autograd import numpy as anp
+
+#No exponential available- must define Weibull with rho = 1
+class ExponentialAFTFitter(WeibullAFTFitter):
+    def _log_likelihood(self, params, T, E, Xs):
+        params_ = params.copy()
+        params_["rho_"] = anp.array([1.0])
+        return super()._log_likelihood(params_, T, E, Xs)
+
+#Fitting and outputting the exponential model
+exp_aft = ExponentialAFTFitter()
+exp_aft.fit(df, duration_col=duration_col, event_col=event_col)
+
+print("=== Exponential AFT Model Coefficients ===")
+print(exp_aft.summary)
+
+#AIC and c-index calculations
+print("\nAIC:", exp_aft.AIC_)
+predicted_median = exp_aft.predict_median(df)
+c_index = concordance_index(
+    df[duration_col],
+    -predicted_median,
+    df[event_col]
 )
-display(styled_table)
+print("C-index:", c_index)
 
-#Markdown format (test format, not relevant to paper)
-print('\n**Schoenfeld Test for Proportional Hazards (log(time) transformation)**\n')
-print('| Covariate            | Test_statistic | P-value   | -log₂(P) |')
-print('|:--------------------:|:--------------:|:---------:|:--------:|')
-for _, row in table.iterrows():
-    print(f"| {row['Covariate']} | {row['Test_statistic']} | {row['P-value']} | {row['-log₂(P)']} |")
+#Preparing survival data (for the scikit package)
 
-#Kaplan Meir Curve (unstratified)
+y_struct = np.array([(bool(e), t) for e, t in zip(df['status'], df['OS'])],
+                    dtype=[('event', 'bool'), ('time', 'float')])
 
-#Loading and preparing data
-filename = '/content/pone.0148733.s001.xlsx'
-df = pd.read_excel(filename, sheet_name='data')
+#Extracting the feature matrix
+X = df[covariates]
 
-df_kaplan = df[['OS', 'status']].dropna().copy()
-df_kaplan.rename(columns={'OS': 'duration', 'status': 'event'}, inplace=True)
-
-#Fitting the Kaplan-Meier estimator
-kmf = KaplanMeierFitter()
-kmf.fit(durations=df_kaplan['duration'], event_observed=df_kaplan['event'])
-
-#Plotting survival curve from fitted estimator
-plt.figure(figsize=(8, 6))
-kmf.plot(ci_show=True, linewidth=2)
-plt.title('Kaplan-Meier Survival Curve for All Patients', fontsize=16)
-plt.xlabel('Time (months)', fontsize=14)
-plt.ylabel('Survival Probability', fontsize=14)
-plt.grid(True, linestyle='--', alpha=0.6)
-plt.tight_layout()
-plt.show()
-
-#Comparison of Cox model and Exponential AFT
-
-#Loading and preparing data
-filename = '/content/pone.0148733.s001.xlsx'
-df = pd.read_excel(filename, sheet_name='data')
-
-df_comparison = df[['Sex', 'Diagnosis', 'Location', 'KI', 'GTV', 'Stereotactic methods', 'OS', 'status']].dropna().copy()
-df_comparison.rename(columns={'OS': 'duration', 'status': 'event'}, inplace=True)
-
-#Fitting exponential model
-exp_aft = WeibullAFTFitter(penalizer=0.01)
-exp_aft.fit(df_comparison, duration_col='duration', event_col='event')
-
-#Computing c-index
-cox_hazard = cph.predict_partial_hazard(df_comparison)
-exp_predictions = exp_aft.predict_median(df_comparison)
-cindex_cox = concordance_index(df_comparison['duration'], -cox_hazard, df_comparison['event'])
-cindex_exp = concordance_index(df_comparison['duration'], -exp_predictions, df_comparison['event'])
-
-#Creating and displaying table of information
-summary_df = pd.DataFrame({
-    'Model': ['Cox Proportional Hazards', 'Exponential AFT'],
-    'C-Index': [cindex_cox, cindex_exp],
-    'AIC': [cph.AIC_partial_, exp_aft.AIC_]
-}).round(4)
-
-styled_summary = (
-    summary_df
-    .style
-    .set_caption("Table 2: Model Performance Comparison")
-    .format({'C-Index': '{:.3f}', 'AIC': '{:.1f}'})
-    .hide(axis='index')
-    .set_properties(subset=summary_df.columns, **{
-        'text-align': 'center'
-    })
-    .set_table_styles([
-        {'selector': 'th', 'props': [('text-align', 'center')]},
-        {'selector': 'caption',
-         'props': [('font-size', '14pt'), ('font-weight', 'bold'), ('text-align', 'center')]},
-        {'selector': 'td', 'props': [('text-align', 'center')]},
-        {'selector': 'table', 'props': [('margin-left', 'auto'), ('margin-right', 'auto')]}
-    ])
+#Fitting the RSF model (based on recommended hyperparameters)
+rsf = RandomSurvivalForest(
+    n_estimators=100,
+    max_features="sqrt",
+    min_samples_leaf=3,
+    n_jobs=-1,
+    random_state=42
 )
-display(styled_summary)
+rsf.fit(X, y_struct)
 
-#Random Survival Forest for survival function
-
-#Loading, preparing, and splitting the data
-data = pd.read_excel('pone.0148733.s001.xlsx', sheet_name='data')
-data = data.dropna(subset=['OS', 'status'])
-
-X = data[['Sex', 'Diagnosis', 'Location', 'KI', 'GTV', 'Stereotactic methods']]
-y = Surv.from_arrays(event=data['status'].astype(bool), time=data['OS'])
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
-)
-
-#Fitting RSF model
-rsf = RandomSurvivalForest(max_features='sqrt', random_state=42)
-rsf.fit(X_train, y_train)
-
-#Calculating and projecting c-index
-cindex_test = rsf.score(X_test, y_test)
-
-summary_df = pd.DataFrame({
-    'Model': ['Random Survival Forest'],
-    'C-Index': [cindex_test]
-}).round(4)
-
-styled_summary = (
-    summary_df
-    .style
-    .set_caption("Table: Model Performance (Test Data)")
-    .format({'C-Index': '{:.3f}'})
-    .hide(axis='index')
-    .set_properties(subset=summary_df.columns, **{'text-align': 'center'})
-    .set_table_styles([
-        {'selector': 'th', 'props': [('text-align', 'center')]},
-        {'selector': 'caption',
-         'props': [('font-size', '14pt'), ('font-weight', 'bold'), ('text-align', 'center')]},
-        {'selector': 'td', 'props': [('text-align', 'center')]},
-        {'selector': 'table', 'props': [('margin-left', 'auto'), ('margin-right', 'auto')]}
-    ])
-)
-
-display(styled_summary)
-
-#Permutation feature importance from RSF
-
-#Function permutes all feature vectors and computes c-index drop in the RSF model for each permutation
-def rsf_permutation_importance(model, X, y, n_repeats=10, random_state=42):
-    rng = np.random.RandomState(random_state)
-    baseline_pred = model.predict(X)
-    baseline_cindex = concordance_index_censored(
-        y['event'], y['time'], baseline_pred
-    )[0]
-    importances = []
-    stds = []
-    for col in X.columns:
-        scores = []
-        X_permuted = X.copy()
-        for _ in range(n_repeats):
-            X_permuted[col] = rng.permutation(X_permuted[col].values)
-            pred = model.predict(X_permuted)
-            cindex = concordance_index_censored(
-                y['event'], y['time'], pred
-            )[0]
-            scores.append(baseline_cindex - cindex)
-        importances.append(np.mean(scores))
-        stds.append(np.std(scores))
-    return np.array(importances), np.array(stds)
-
-#Stores mean and standard deviation of c-index drop
-importances, stds = rsf_permutation_importance(rsf, X_test, y_test, n_repeats=20)
-
-#(For paper only) ordering and renaming treatment feature for easy display before plotting
-indices = np.argsort(importances)[::-1]
-feature_names = X_test.columns[indices]
-
-display_names = [name if name != "Stereotactic methods" else "Treatment" for name in feature_names]
-
-plt.figure(figsize=(8, 5))
-plt.title("RSF Feature Importance")
-plt.bar(range(len(importances)), importances[indices], yerr=stds[indices], align="center", capsize=5)
-plt.xticks(range(len(importances)), display_names, rotation=45, ha='right')
-plt.ylabel("Mean C-index Decrease")
-plt.xlabel("Covariate")
-plt.tight_layout()
-plt.show()
-
-#Running cox regression
-
-#Loading and preparing the data
-data_path = '/content/pone.0148733.s001.xlsx'
-df = pd.read_excel(data_path, sheet_name='data')
-
-covariates = ['Sex', 'Diagnosis', 'Location', 'KI', 'GTV', 'Stereotactic methods']
-df_clean = df[['OS', 'status'] + covariates].dropna().copy()
-df_clean.rename(columns={'OS': 'duration', 'status': 'event'}, inplace=True)
-
-#Fitting the Cox PH model
-cph = CoxPHFitter()
-cph.fit(df_clean, duration_col='duration', event_col='event')
-
-#Labeling table
-label_map = {
-    'Sex': 'Sex (male/female)',
-    'Diagnosis': 'Diagnosis (per category increase: meningioma→LG glioma→HG glioma→other)',
-    'Location': 'Location (supratentorial/infratentorial)',
-    'KI': 'Karnofsky Index (per point increase)',
-    'GTV': 'Gross Tumor Volume (per cm³ increase)',
-    'Stereotactic methods': 'Stereotactic method (SRT/SRS)'
-}
-
-#Creating table of resultant hazard ratios and confidence intervals from analysis
-summary = cph.summary.copy()
-summary['Covariate'] = summary.index.map(label_map)
-summary['Hazard Ratio'] = np.exp(summary['coef'])
-summary['95% CI Lower'] = np.exp(summary['coef lower 95%'])
-summary['95% CI Upper'] = np.exp(summary['coef upper 95%'])
-
-def format_float(x):
-    return f"{x:.4f}".rstrip('0').rstrip('.') if '.' in f"{x:.4f}" else f"{x:.4f}"
-
-summary['Hazard Ratio'] = summary['Hazard Ratio'].apply(format_float)
-summary['95% CI'] = summary.apply(lambda row: f"[{format_float(row['95% CI Lower'])}, {format_float(row['95% CI Upper'])}]", axis=1)
-
-final_table = summary[['Covariate', 'Hazard Ratio', '95% CI']].reset_index(drop=True)
-
-print("\n**Cox Proportional Hazards Regression Results**\n")
-print("| Covariate                                         | Hazard Ratio | 95% CI             |")
-print("|:--------------------------------------------------|:------------:|:------------------:|")
-for _, row in final_table.iterrows():
-    print(f"| {row['Covariate']:<50} | {row['Hazard Ratio']:^12} | {row['95% CI']:^18} |")
-
-#Predicted Survival Function for Model Patient from Cox PH
-
-#Loading and preparing data and selecting patient
-file_path = "pone.0148733.s001.xlsx"
-df = pd.read_excel(file_path, sheet_name='data')
-
-patient_id = 86
-covariates = ['Sex', 'Diagnosis', 'Location', 'KI', 'GTV', 'Stereotactic methods']
-
-#When predicting a patient's survival time, it would be silly to include their post-mortem result in the training
-df_omit = df[df['ID'] != patient_id].copy()
-df_omit_clean = df_omit[['OS', 'status'] + covariates].dropna()
-
-#Fitting the Cox PH model
-cph = CoxPHFitter()
-cph.fit(df_omit_clean, duration_col='OS', event_col='status')
-
-#Finding maximum possible survival time from patient's covariates
-patient_row = df[df['ID'] == patient_id]
-patient_covariates = patient_row[covariates]
-
-max_time = df['OS'].max()
-print(f"Maximum observed survival time in the full dataset: {max_time:.2f} months")
-
-#Using Cox model to predict probability of patient's survival, given their covariate row vector, at each point in a time during 200 evenly spaced increments between inception and max_time
-time_grid = np.linspace(0, max_time, 200)
-surv_func = cph.predict_survival_function(patient_covariates, times=time_grid)
-
-#Plotting these discrete probabilities onto a curve
-plt.figure(figsize=(8,6))
-plt.plot(surv_func.index, surv_func.values, label='Predicted survival for patient 86', color='blue', linewidth=2)
-plt.xlim(0, max_time + 2)
-plt.ylim(0, 1.05)
-plt.title('Cox Model Predicted Survival Function for Patient 86')
-plt.xlabel('Time (months)')
-plt.ylabel('Survival Probability')
-plt.grid(True, linestyle='--', alpha=0.6)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-#Kaplan-Meier curves, stratified by sex
-
-#Loading and preparing the data
-file_path = "pone.0148733.s001.xlsx"
-df = pd.read_excel(file_path, sheet_name='data')
-
-sex_map = {0: "Female", 1: "Male"}
-df = df[df['Sex'].isin([0,1])]
-
-#Masking to select only one sex, fitting Kaplan-Meier estimator to it, repeating for other sex
-plt.figure(figsize=(8,6))
-
-for sex_code, sex_label in sex_map.items():
-    mask = df['Sex'] == sex_code
-    kmf = KaplanMeierFitter()
-    kmf.fit(df.loc[mask, 'OS'], event_observed=df.loc[mask, 'status'], label=sex_label)
-    kmf.plot(ci_show=True, linewidth=2)
-
-#Plotting resultant Kaplan-Meier survival curves
-plt.title('Kaplan-Meier Survival Curves by Sex')
-plt.xlabel('Time (months)')
-plt.ylabel('Survival Probability')
-plt.grid(True, linestyle='--', alpha=0.6)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-#Kaplan-meier curves, stratified by tumor location
-
-file_path = "pone.0148733.s001.xlsx"
-df = pd.read_excel(file_path, sheet_name='data')
-
-location_map = {0: "Infratentorial", 1: "Supratentorial"}
-df = df[df['Location'].isin([0, 1])]
-
-plt.figure(figsize=(8,6))
-
-for loc_code, loc_label in location_map.items():
-    mask = df['Location'] == loc_code
-    kmf = KaplanMeierFitter()
-    kmf.fit(df.loc[mask, 'OS'], event_observed=df.loc[mask, 'status'], label=loc_label)
-    kmf.plot(ci_show=True, linewidth=2)
-
-plt.title('Kaplan-Meier Survival Curves by Tumor Location')
-plt.xlabel('Time (months)')
-plt.ylabel('Survival Probability')
-plt.grid(True, linestyle='--', alpha=0.6)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-#Kaplan-meier curves, stratified by treatment
-
-file_path = "pone.0148733.s001.xlsx"
-df = pd.read_excel(file_path, sheet_name='data')
-
-stereo_map = {0: "SRS", 1: "SRT"}
-df = df[df['Stereotactic methods'].isin([0, 1])]
-
-plt.figure(figsize=(8,6))
-
-for method_code, method_label in stereo_map.items():
-    mask = df['Stereotactic methods'] == method_code
-    kmf = KaplanMeierFitter()
-    kmf.fit(df.loc[mask, 'OS'], event_observed=df.loc[mask, 'status'], label=method_label)
-    kmf.plot(ci_show=True, linewidth=2)
-
-plt.title('Kaplan-Meier Survival Curves by Stereotactic Method')
-plt.xlabel('Time (months)')
-plt.ylabel('Survival Probability')
-plt.grid(True, linestyle='--', alpha=0.6)
-plt.legend()
-plt.tight_layout()
-plt.show()
+#C-index (on full data due to sample size constrictions)
+cindex = concordance_index_censored(
+    y_struct["event"], y_struct["time"], rsf.predict(X)
+)[0]
+print("Random Survival Forest C-index:", cindex)
 
 #Log-rank test results (two groups)
 
-#Loading and preparing the data
-file_path = "pone.0148733.s001.xlsx"
-df = pd.read_excel(file_path, sheet_name='data')
-
+#Explicit group differentiation
 group_defs = {
     "Sex": ("Sex", {0: "Female", 1: "Male"}),
     "Location": ("Location", {0: "Infratentorial", 1: "Supratentorial"}),
@@ -517,39 +311,9 @@ styled_table = (
 
 display(styled_table)
 
-#Kaplan-meier curves, stratified by diagnosis (same as other stratifications but with four curves)
-
-df = pd.read_excel("pone.0148733.s001.xlsx", sheet_name='data')
-diagnosis_map = {0: "Meningioma", 1: "LG glioma", 2: "HG glioma", 3: "other"}
-
-df = df.dropna(subset=['Diagnosis'])
-df['Diagnosis'] = df['Diagnosis'].astype(int)
-
-plt.figure(figsize=(10, 6))
-colors = ['blue', 'green', 'red', 'purple']
-
-for diagnosis_code, color in zip(sorted(df['Diagnosis'].unique()), colors):
-    mask = df['Diagnosis'] == diagnosis_code
-    kmf = KaplanMeierFitter()
-    kmf.fit(df.loc[mask, 'OS'],
-            event_observed=df.loc[mask, 'status'],
-            label=diagnosis_map[diagnosis_code])
-    kmf.plot(ci_show=True, color=color, linewidth=2)
-
-plt.title('Kaplan-Meier Survival Curves by Tumor Diagnosis')
-plt.xlabel('Time (months)')
-plt.ylabel('Survival Probability')
-plt.grid(True, linestyle='--', alpha=0.6)
-plt.legend(title='Diagnosis')
-plt.tight_layout()
-plt.show()
-
 #Multivariate Log-rank test results
 
-#Loading and preparing the data
-file_path = "/content/pone.0148733.s001.xlsx"
-df = pd.read_excel(file_path, sheet_name='data')
-
+#Ensuring diagnosis specifically is cleaned (again)
 df_clean = df.dropna(subset=['Diagnosis']).copy()
 df_clean['Diagnosis'] = df_clean['Diagnosis'].astype(int)
 
@@ -609,3 +373,89 @@ styled_table = (
 )
 
 display(styled_table)
+
+#Stratifying Kaplan-Meier curves by treatment
+
+#Further preparing the data
+stereo_map = {0: "SRS", 1: "SRT"}
+df = df[df['Stereotactic methods'].isin([0, 1])]
+plt.figure(figsize=(8, 6))
+
+#Colors and color matching (for paper)
+colors = ['red', 'blue']
+stereo_methods = sorted(stereo_map.keys())
+
+for i, method_code in enumerate(stereo_methods):
+    method_label = stereo_map[method_code]
+    mask = df['Stereotactic methods'] == method_code
+    kmf = KaplanMeierFitter()
+    kmf.fit(df.loc[mask, 'OS'], event_observed=df.loc[mask, 'status'], label=method_label)
+    kmf.plot(ci_show=True, linewidth=2, color=colors[i])
+
+
+#Plotting everything
+plt.title('Kaplan-Meier Survival Curves by Stereotactic Method')
+plt.xlabel('Time (months)')
+plt.ylabel('Survival Probability')
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+#Kaplan-meier curves, stratified by diagnosis (same as other stratifications but with four curves)
+diagnosis_map = {0: "Meningioma", 1: "LG glioma", 2: "HG glioma", 3: "other"}
+df['Diagnosis'] = df['Diagnosis'].astype(int)
+plt.figure(figsize=(10, 6))
+colors = ['blue', 'green', 'red', 'purple']
+
+for diagnosis_code, color in zip(sorted(df['Diagnosis'].unique()), colors):
+    mask = df['Diagnosis'] == diagnosis_code
+    kmf = KaplanMeierFitter()
+    kmf.fit(df.loc[mask, 'OS'],
+            event_observed=df.loc[mask, 'status'],
+            label=diagnosis_map[diagnosis_code])
+    kmf.plot(ci_show=True, color=color, linewidth=2)
+
+plt.title('Kaplan-Meier Survival Curves by Tumor Diagnosis')
+plt.xlabel('Time (months)')
+plt.ylabel('Survival Probability')
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend(title='Diagnosis')
+plt.tight_layout()
+plt.show()
+
+#Appendix information
+
+#Splitting covariates
+categorical_covariates = ['Sex', 'Diagnosis', 'Location', 'Stereotactic methods', 'status']
+quantitative_covariates = ['KI', 'GTV', 'OS']
+
+#Picking colors for paper
+color = 'skyblue'
+edgecolor = 'black'
+
+#8 plots (6 in paper, 2 for personal investigation)
+fig, axes = plt.subplots(2, 4, figsize=(24, 10))
+axes = axes.flatten()
+
+#Bar charts for categorical
+for i, cov in enumerate(categorical_covariates):
+    counts = df[cov].value_counts().sort_index()
+    axes[i].bar(counts.index.astype(str), counts.values, color=color, edgecolor=edgecolor)
+    axes[i].set_title(f'Frequency of {cov}')
+    axes[i].set_xlabel(cov)
+    axes[i].set_ylabel('Count')
+    axes[i].tick_params(axis='x', rotation=45)
+
+#Histograms for quantitative
+for j, cov in enumerate(quantitative_covariates):
+    ax_idx = len(categorical_covariates) + j  # maps to axes[5], [6], [7]
+    axes[ax_idx].hist(df[cov].dropna(), bins=15, color=color, edgecolor=edgecolor)
+    axes[ax_idx].set_title(f'Distribution of {cov}')
+    axes[ax_idx].set_xlabel(cov)
+    axes[ax_idx].set_ylabel('Frequency')
+
+
+plt.tight_layout()
+plt.show()
+
