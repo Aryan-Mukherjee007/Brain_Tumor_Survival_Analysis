@@ -1,4 +1,5 @@
 #Imports and package installations
+
 !pip install lifelines
 !pip install scikit-survival openpyxl --quiet
 
@@ -117,23 +118,21 @@ z_logg = log_g_hat / se[-1] if np.isfinite(se[-1]) else np.nan
 p_logg = 2 * (1 - norm.cdf(np.abs(z_logg))) if np.isfinite(z_logg) else np.nan
 se_gamma = gamma_hat * se[-1] if np.isfinite(se[-1]) else np.nan
 
-# -----------------------------
-# 6) Summaries
-# -----------------------------
+#Printing regression results
 coef_table = pd.DataFrame({
     'coef (beta)': beta_hat,
-    'std err':     se[:-1],
-    'z':           z_vals,
-    'p>|z|':       p_vals
+    'std err': se[:-1],
+    'z': z_vals,
+    'p>|z|': p_vals
 }, index=colnames)
 
 gamma_table = pd.DataFrame({
     'estimate (gamma)': [gamma_hat],
-    'std err (gamma)':  [se_gamma],
-    'log(gamma)':       [log_g_hat],
-    'std err log(gamma)':[se[-1]],
+    'std err (gamma)': [se_gamma],
+    'log(gamma)': [log_g_hat],
+    'std err log(gamma)': [se[-1]],
     'z for log(gamma)': [z_logg],
-    'p>|z| (log gamma)':[p_logg]
+    'p>|z| (log gamma)': [p_logg]
 }, index=['shape'])
 
 print("\n=== Log-Logistic AFT (MLE, with standardized covariates, ID excluded) ===")
@@ -269,7 +268,7 @@ for var, (col, label_map) in group_defs.items():
 #Storing p-value results in a dictionary
 results_df = pd.DataFrame(results)
 
-#Producing tablee (no longer relevant for paper)
+#Producing table (no longer relevant for paper)
 styled_table = (
     results_df
     .style
@@ -403,6 +402,7 @@ plt.tight_layout()
 plt.show()
 
 #Kaplan-meier curves, stratified by diagnosis (same as other stratifications but with four curves)
+
 diagnosis_map = {0: "Meningioma", 1: "LG glioma", 2: "HG glioma", 3: "other"}
 df['Diagnosis'] = df['Diagnosis'].astype(int)
 plt.figure(figsize=(10, 6))
